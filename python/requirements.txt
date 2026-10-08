@@ -1,0 +1,4 @@
+# GulfPost dispatch agent prototype - Python version.
+# Only these two libraries, per CLAUDE.md. Ask before adding anything else.
+streamlit>=1.30
+pandas>=2.0

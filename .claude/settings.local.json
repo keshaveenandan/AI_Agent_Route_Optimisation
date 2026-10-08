@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m streamlit run python/app.py --server.headless=true --server.port=8502 --browser.gatherUsageStats=false)",
+      "Bash(python -m venv python/.venv)",
+      "Bash(./python/.venv/Scripts/python.exe --version)",
+      "Bash(./python/.venv/Scripts/python.exe -m streamlit --version)",
+      "Bash(./python/.venv/Scripts/python.exe -c \"import sys, streamlit, pandas; print\\('python  :', sys.executable\\); print\\('streamlit:', streamlit.__file__\\); print\\('pandas  :', pandas.__file__\\)\")",
+      "Bash(../python/.venv/Scripts/python.exe check_scenario.py)",
+      "Bash(./.venv/Scripts/python.exe check_scenario.py)",
+      "Bash(./python/.venv/Scripts/python.exe python/check_rules.py)"
+    ]
+  }
+}
