@@ -314,6 +314,89 @@ def build_scenario(seed=DEFAULT_SEED, break_it=False):
 
 
 # ---------------------------------------------------------------------------
+# The sick-call simulator
+# ---------------------------------------------------------------------------
+# The case-study story is fixed: D03, D04 and D05, all at 04:45. This generates
+# other mornings instead - a different number of drivers calling in, at
+# different times - so the agent can be tried against a morning nobody designed
+# for it.
+
+# Calls can only land in this window. Before 04:30 nobody is awake to answer;
+# after 05:20 the vans are loading and it is too late to re-plan calmly.
+EARLIEST_CALL = "04:30"
+LATEST_CALL = "05:20"
+
+# Most calls cluster around the usual time, with a few stragglers either side.
+TYPICAL_CALL_TIME = "04:45"
+CALL_TIME_SPREAD_MINUTES = 12.0
+
+# How many drivers call in sick. Weighted towards 0, 1 or 2 - a morning losing
+# five drivers at once should be possible but rare.
+CALL_COUNT_WEIGHTS = {0: 18, 1: 30, 2: 24, 3: 15, 4: 8, 5: 5}
+
+
+def _clock_to_minutes(clock):
+    """'04:45' -> 285. A local copy so scenario.py needs no imports from agent.py."""
+    hours, minutes = clock.split(":")
+    return int(hours) * 60 + int(minutes)
+
+
+def minutes_to_clock(minutes):
+    """285 -> '04:45'. Handy for printing call times."""
+    total = int(round(minutes))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def simulate_sick_calls(driver_ids, seed):
+    """Invent one morning's worth of sick calls.
+
+    driver_ids - who could possibly call in (usually all 20)
+    seed       - same seed, same morning, every time
+
+    Returns a list of (minute, driver_id) pairs sorted by time, where minute is
+    minutes since midnight. An empty list is a perfectly good answer: some
+    mornings nobody calls in at all.
+    """
+    rng = random.Random(seed)
+
+    earliest = _clock_to_minutes(EARLIEST_CALL)
+    latest = _clock_to_minutes(LATEST_CALL)
+    typical = _clock_to_minutes(TYPICAL_CALL_TIME)
+
+    # How many drivers call in, weighted towards the quieter mornings.
+    counts = list(CALL_COUNT_WEIGHTS.keys())
+    weights = list(CALL_COUNT_WEIGHTS.values())
+    how_many = rng.choices(counts, weights=weights, k=1)[0]
+    how_many = min(how_many, len(driver_ids))
+
+    if how_many == 0:
+        return []
+
+    # Who. Sampled without replacement, so nobody calls in twice.
+    callers = rng.sample(sorted(driver_ids), how_many)
+
+    # When. Clustered around 04:45. If a draw falls outside the window we draw
+    # again rather than clamp, because clamping would pile several calls onto
+    # exactly 04:30 and that looks like a pattern rather than a coincidence.
+    calls = []
+    for driver_id in callers:
+        minute = None
+        for _attempt in range(50):
+            candidate = round(rng.gauss(typical, CALL_TIME_SPREAD_MINUTES))
+            if earliest <= candidate <= latest:
+                minute = candidate
+                break
+        if minute is None:
+            # Vanishingly unlikely, but never leave a caller without a time.
+            minute = typical
+        calls.append((minute, driver_id))
+
+    # Earliest first. Driver id breaks ties so the order never wobbles.
+    calls.sort(key=lambda call: (call[0], call[1]))
+    return calls
+
+
+# ---------------------------------------------------------------------------
 # Self-check report - run this file directly to see it
 # ---------------------------------------------------------------------------
 # Everything below here is for checking the data by eye. It is not used by the
