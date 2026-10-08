@@ -26,6 +26,17 @@ DEPOT = (0.0, 0.0)  # (x_km, y_km) - every route starts here
 NUM_DRIVERS = 20
 SLICE_DEGREES = 360.0 / NUM_DRIVERS  # 18 degrees of the circle each
 
+# Invented names, one per driver, in D01 to D20 order. The voice agent needs
+# something to greet a caller by and to read back for confirmation - "D07" is
+# a row in a database, not how anyone answers the phone. All synthetic.
+DRIVER_NAMES = [
+    "Rashid Al Mansoori", "Imran Qureshi", "Bilal Haddad", "Suresh Nair",
+    "Yusuf Demir", "Arun Pillai", "Omar Shaikh", "Tariq Jamal",
+    "Nikhil Rao", "Faisal Noor", "Sanjay Menon", "Hamza Iqbal",
+    "Ravi Kumar", "Zayd Othman", "Pradeep Varma", "Adnan Ali",
+    "Karim Saleh", "Vikram Shetty", "Mustafa Riaz", "Jatin Desai",
+]
+
 # Most drivers get a random number of parcels in this range...
 MIN_PARCELS = 15
 MAX_PARCELS = 18
@@ -60,6 +71,51 @@ SHARE_ESTIMATED_BROKEN = 0.50
 
 # Addresses where we know the district but not the exact spot.
 SHARE_AREA_ONLY = 0.10
+
+# --- the district names ----------------------------------------------------
+# Every address sits in a district. One name per driver slice, so a parcel's
+# district is a plain consequence of where it is - no extra randomness needed.
+# Invented names with a Gulf flavour; none of these are real delivery areas.
+DISTRICT_NAMES = [
+    "Al Quoz", "Al Barsha", "Deira", "Al Karama", "Jebel Ali",
+    "Mirdif", "Al Nahda", "Oud Metha", "Al Qusais", "Satwa",
+    "Ras Al Khor", "Al Warqa", "Nad Al Sheba", "Umm Suqeim", "Garhoud",
+    "Al Twar", "Muhaisnah", "Al Rashidiya", "Hor Al Anz", "Al Safa",
+]
+
+# How wide a district is, for the "we only know the district" case. The
+# recorded point is somewhere in the district; the real doorstep is within this
+# many km of it. 1.5 km is deliberately modest - a wrong guess should cost the
+# driver a few minutes of hunting, not send the van to the wrong town.
+AREA_RADIUS_MIN_KM = 0.6
+AREA_RADIUS_MAX_KM = 1.5
+
+# --- the location pings ----------------------------------------------------
+# This is the Meesho-style trick. Every time a courier completes a delivery
+# their handset records where it was standing. Do that often enough at one
+# address and the cloud of pings tells you where the door actually is, even
+# though the written address never got any better.
+#
+# How many past deliveries we have a ping for. Weighted so most addresses have
+# a usable handful, some are nearly new, and a few have never been delivered to
+# at all - those are the ones no amount of cleverness can rescue.
+PING_COUNT_WEIGHTS = {0: 6, 1: 8, 2: 10, 3: 16, 4: 16, 5: 14, 6: 12, 7: 9, 8: 6, 9: 3}
+
+# Handset GPS is good but not perfect: a ping lands this far from where the
+# courier was really standing.
+PING_NOISE_MIN_KM = 0.03
+PING_NOISE_MAX_KM = 0.12
+
+# Sometimes the ping is honestly misleading - the courier handed over at the
+# compound gate, or met the customer at the shop on the main road. Those pings
+# are real, they are just not the door, and a resolver that trusts them blindly
+# will put the pin in the wrong place.
+SHARE_PINGS_OFF_DOOR = 0.18
+PING_OFF_DOOR_MIN_KM = 0.35
+PING_OFF_DOOR_MAX_KM = 1.10
+
+# Pings are from the last two months of deliveries.
+PING_OLDEST_DAYS = 60
 
 # The priority customer in the story: 3 parcels on D04's route, due by midday.
 PRIORITY_CUSTOMER = "AlGulf Air"
@@ -103,6 +159,9 @@ def _make_drivers():
 
     The slice midpoint is what Stage 4 will use to answer "which working
     drivers are closest to the gap left by an absent driver".
+
+    The name, phone number and district come from fixed lists rather than a
+    random generator, so adding them cannot disturb a single parcel position.
     """
     drivers = []
     for index in range(NUM_DRIVERS):
@@ -110,12 +169,38 @@ def _make_drivers():
         drivers.append(
             {
                 "id": f"D{index + 1:02d}",  # D01, D02, ... D20
+                "name": DRIVER_NAMES[index],
+                # Worked out from the index, not drawn at random, so the same
+                # driver always has the same number.
+                "phone": f"+971 50 {400 + index:03d} {7100 + index * 37:04d}",
+                "district": DISTRICT_NAMES[index],
                 "slice_start_deg": slice_start,
                 "slice_end_deg": slice_start + SLICE_DEGREES,
                 "slice_mid_deg": slice_start + SLICE_DEGREES / 2.0,
             }
         )
     return drivers
+
+
+def driver_name(scenario, driver_id):
+    """'D04' -> 'Suresh Nair'. Falls back to the id if the driver is unknown."""
+    for driver in scenario["drivers"]:
+        if driver["id"] == driver_id:
+            return driver["name"]
+    return driver_id
+
+
+def _district_for(driver, radius_km):
+    """A district name like 'Al Barsha 3' for an address in this driver's slice.
+
+    The slice gives the name and the distance from the depot gives the number,
+    so neighbouring parcels share a district and far-apart ones do not. Worked
+    out from geometry, never drawn at random: the same spot is always in the
+    same district.
+    """
+    # Rings every 2.5 km, so 2-12 km from the depot gives districts 1 to 4.
+    ring = min(4, max(1, int((radius_km - MIN_RADIUS_KM) // 2.5) + 1))
+    return f"{driver['district']} {ring}"
 
 
 def _parcel_count_for(driver_id, rng):
@@ -135,6 +220,15 @@ def _make_parcels(drivers, rng):
     They are the same until _apply_estimated_weights() replaces some of them
     with the cautious default. Keeping both means "break it" mode only changes
     what the planner *knows*, never what is physically on the van.
+
+    Each parcel also keeps two positions, for exactly the same reason:
+      - recorded_x_km / recorded_y_km: the spot written on the label, which is
+        what the planner uses
+      - true_x_km / true_y_km:         where the door actually is
+
+    They are identical here. _apply_area_only() later pulls them apart for the
+    addresses we only know the district of, so "break it" and the area-only
+    flag change what the planner *believes*, never the real world.
     """
     parcels = {}
     next_number = 1
@@ -162,11 +256,28 @@ def _make_parcels(drivers, rng):
                 "driver": driver["id"],  # yesterday's owner
                 "x_km": round(x_km, 3),
                 "y_km": round(y_km, 3),
+                # What the label says. x_km/y_km can later be improved from
+                # the ping history; this pair never changes, so the screen can
+                # always show how far the pin moved and why.
+                "recorded_x_km": round(x_km, 3),
+                "recorded_y_km": round(y_km, 3),
+                # Where the door really is. The planner must never read these -
+                # they exist so the prototype can be honest about whether the
+                # address guesses were any good.
+                "true_x_km": round(x_km, 3),
+                "true_y_km": round(y_km, 3),
                 "distance_from_depot_km": round(radius, 3),
                 "real_weight_kg": real_weight,
                 "weight_kg": real_weight,
                 "weight_estimated": False,
                 "area_only": False,
+                # Set to True once a ping-based pin has been adopted.
+                "address_resolved": False,
+                "area_radius_km": 0.0,
+                "district": _district_for(driver, radius),
+                # Past delivery pings at this address. Only area-only parcels
+                # get any: for a precise address there is nothing to work out.
+                "pings": [],
                 "priority": False,
                 "deadline": None,
                 "customer": "Standard",
@@ -232,6 +343,89 @@ def _apply_area_only(parcels, rng):
     _apply_flag_to_share(parcels, SHARE_AREA_ONLY, rng, mark)
 
 
+def _offset_point(x_km, y_km, distance_km_out, angle_deg):
+    """Move a point distance_km_out in the direction angle_deg."""
+    return (
+        x_km + distance_km_out * math.cos(math.radians(angle_deg)),
+        y_km + distance_km_out * math.sin(math.radians(angle_deg)),
+    )
+
+
+def _add_location_pings(parcels, rng):
+    """Give every area-only address a real door and a history of pings.
+
+    For an address where only the district is known, two things are true that
+    the label does not say:
+
+      1. The real door is somewhere near the recorded point, not on it. We pick
+         a spot within the district radius and record it as true_x/true_y.
+      2. Couriers have delivered here before, and their handsets logged where
+         they were standing. Most of those pings cluster on the real door;
+         some are honestly misleading, taken at a compound gate or a shop on
+         the main road.
+
+    An address with several tight, recent pings can be pinned down almost
+    exactly. One with two scattered pings cannot, and one that has never been
+    delivered to cannot be helped at all. That spread is the point: the agent
+    has to know the difference and only act where it is confident.
+
+    Parcels are walked in sorted id order so the result never depends on the
+    order some earlier step happened to touch them in.
+    """
+    for parcel_id in sorted(parcels):
+        parcel = parcels[parcel_id]
+        if not parcel["area_only"]:
+            continue
+
+        # 1. How vague is this district, and where is the door really?
+        radius = rng.uniform(AREA_RADIUS_MIN_KM, AREA_RADIUS_MAX_KM)
+        true_x, true_y = _offset_point(
+            parcel["recorded_x_km"],
+            parcel["recorded_y_km"],
+            rng.uniform(0.0, radius),
+            rng.uniform(0.0, 360.0),
+        )
+        parcel["area_radius_km"] = round(radius, 3)
+        parcel["true_x_km"] = round(true_x, 3)
+        parcel["true_y_km"] = round(true_y, 3)
+
+        # 2. The ping history.
+        counts = list(PING_COUNT_WEIGHTS.keys())
+        weights = list(PING_COUNT_WEIGHTS.values())
+        how_many = rng.choices(counts, weights=weights, k=1)[0]
+
+        pings = []
+        for _ in range(how_many):
+            off_door = rng.random() < SHARE_PINGS_OFF_DOOR
+            if off_door:
+                # Handed over somewhere else nearby - a real ping, wrong door.
+                away = rng.uniform(PING_OFF_DOOR_MIN_KM, PING_OFF_DOOR_MAX_KM)
+            else:
+                # Standing at the door, with ordinary handset GPS error.
+                away = rng.uniform(PING_NOISE_MIN_KM, PING_NOISE_MAX_KM)
+
+            ping_x, ping_y = _offset_point(
+                true_x, true_y, away, rng.uniform(0.0, 360.0)
+            )
+            pings.append(
+                {
+                    "x_km": round(ping_x, 4),
+                    "y_km": round(ping_y, 4),
+                    "days_ago": rng.randint(1, PING_OLDEST_DAYS),
+                    "dwell_minutes": rng.randint(1, 9),
+                    # Ground truth, for the honesty panel on the screen only.
+                    # The resolver in addresses.py must never read this - its
+                    # whole job is to work out which pings to distrust without
+                    # being told.
+                    "really_off_door": off_door,
+                }
+            )
+
+        # Most recent first, which is also how a human would want to read them.
+        pings.sort(key=lambda ping: (ping["days_ago"], ping["x_km"]))
+        parcel["pings"] = pings
+
+
 def nearest_neighbour_route(parcels, parcel_ids):
     """Order a set of parcels by always driving to the closest next stop.
 
@@ -278,21 +472,32 @@ def build_scenario(seed=DEFAULT_SEED, break_it=False):
       yesterday_routes - dict of driver id -> list of parcel ids, in visiting
                          order
       break_it         - what was asked for, kept for the screen to display
+
+    Note that nothing here resolves an area-only address. The parcels carry
+    the pings; working out where the door is, is a decision, and decisions
+    live in agent.py (via addresses.py). build_scenario() always returns the
+    world exactly as the depot's records describe it.
     """
-    # Three separate random generators, all derived from the one seed. This is
+    # Four separate random generators, all derived from the one seed. This is
     # what keeps "break it" mode from disturbing anything else: the generator
     # that chooses estimated weights is not the same one that placed the
     # parcels, so asking it for a different number of picks cannot shift a
     # single parcel on the map.
+    #
+    # The pings generator is separate for the same reason. Inventing a delivery
+    # history must not move a parcel, or the case study would quietly stop
+    # being 47 parcels across 6 routes.
     rng_world = random.Random(seed)
     rng_area_only = random.Random(seed + 1000)
     rng_estimated = random.Random(seed + 2000)
+    rng_pings = random.Random(seed + 3000)
 
     drivers = _make_drivers()
     parcels = _make_parcels(drivers, rng_world)
 
     _mark_priority_parcels(parcels)
     _apply_area_only(parcels, rng_area_only)
+    _add_location_pings(parcels, rng_pings)
 
     share_estimated = SHARE_ESTIMATED_BROKEN if break_it else SHARE_ESTIMATED_NORMAL
     _apply_estimated_weights(parcels, share_estimated, rng_estimated)
@@ -485,6 +690,49 @@ def _print_report(scenario):
     print(
         f"  addresses area only          {share_area:.0%}   "
         f"{_pass_fail(abs(share_area - SHARE_AREA_ONLY) <= 0.02)}  (target 10%)"
+    )
+
+    # --- the address pings -----------------------------------------------
+    area_parcels = [p for p in all_parcels if p["area_only"]]
+    with_pings = [p for p in area_parcels if p["pings"]]
+    never_delivered = [p for p in area_parcels if not p["pings"]]
+    ping_counts = [len(p["pings"]) for p in area_parcels]
+    all_pings = [ping for p in area_parcels for ping in p["pings"]]
+    off_door = [ping for ping in all_pings if ping["really_off_door"]]
+    only_area_has_pings = all(not p["pings"] for p in all_parcels if not p["area_only"])
+    door_within_district = all(
+        distance_km(
+            (p["recorded_x_km"], p["recorded_y_km"]), (p["true_x_km"], p["true_y_km"])
+        )
+        <= p["area_radius_km"] + 0.001
+        for p in area_parcels
+    )
+
+    print("\nADDRESS PINGS (the raw material for pinning down a vague address)")
+    print(f"  area-only addresses          {len(area_parcels)}")
+    print(
+        f"  with some delivery history   {len(with_pings)}"
+        f"  ({len(with_pings) / len(area_parcels):.0%})"
+    )
+    print(
+        f"  never delivered to before    {len(never_delivered)}"
+        f"  (no pings - these cannot be pinned down at all)"
+    )
+    print(
+        f"  pings per address            {min(ping_counts)} to {max(ping_counts)}"
+        f", {sum(ping_counts) / len(area_parcels):.1f} on average"
+    )
+    print(
+        f"  pings taken away from door   {len(off_door)} of {len(all_pings)}   "
+        f"{_pass_fail(abs(len(off_door) / max(1, len(all_pings)) - SHARE_PINGS_OFF_DOOR) <= 0.08)}"
+        f"  (target {SHARE_PINGS_OFF_DOOR:.0%} - the misleading ones)"
+    )
+    print(
+        f"  only area-only have pings          {_pass_fail(only_area_has_pings)}"
+        f"  (a precise address has nothing to work out)"
+    )
+    print(
+        f"  real door inside its district      {_pass_fail(door_within_district)}"
     )
 
     # --- geometry --------------------------------------------------------

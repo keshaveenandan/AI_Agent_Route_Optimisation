@@ -1,14 +1,15 @@
 """A short check on the fake depot (Stage 3 of the worksheet).
 
-Prints the five things worth confirming before we build any agent logic:
+Prints the six things worth confirming before we build any agent logic:
 drivers, total parcels, the absent trio's parcels, the AlGulf Air parcels,
-and how many weights are guesses rather than real.
+how many weights are guesses rather than real, and how much delivery history
+the vague addresses have to be pinned down from.
 
 Run it with:
     python/.venv/Scripts/python.exe python/check_scenario.py
 """
 
-from scenario import build_scenario
+from scenario import build_scenario, distance_km
 
 scenario = build_scenario()          # seed 7, so this is the same every time
 drivers = scenario["drivers"]
@@ -43,3 +44,25 @@ for parcel in parcels:
 # 5. How much of the weight data is a cautious guess rather than a real figure
 estimated = sum(1 for p in parcels if p["weight_estimated"])
 print(f"Estimated weights: {estimated} of {len(parcels)} = {estimated / len(parcels):.0%}")
+
+# 6. The vague addresses, and how much past delivery history each one has.
+# "Off by" is how far the written address is from the real door - the error the
+# ping history is there to fix. addresses.py is what does the fixing; this is
+# just the raw material it has to work with.
+area_only = [p for p in parcels if p["area_only"]]
+print(f"\nArea-only addresses: {len(area_only)} of {len(parcels)} "
+      f"= {len(area_only) / len(parcels):.0%}")
+print("   (district known, exact spot not - these are the ones with ping history)")
+print(f"   {'parcel':<8}{'district':<20}{'pings':>7}{'off by':>9}")
+for parcel in sorted(area_only, key=lambda p: -len(p["pings"]))[:8]:
+    off_by = distance_km(
+        (parcel["recorded_x_km"], parcel["recorded_y_km"]),
+        (parcel["true_x_km"], parcel["true_y_km"]),
+    )
+    print(f"   {parcel['id']:<8}{parcel['district']:<20}"
+          f"{len(parcel['pings']):>7}{off_by * 1000:>7.0f} m")
+
+no_history = [p for p in area_only if not p["pings"]]
+print(f"   ... {len(area_only) - 8} more" if len(area_only) > 8 else "")
+print(f"   with no delivery history at all: {len(no_history)} "
+      f"({', '.join(p['id'] for p in no_history) or 'none'})")

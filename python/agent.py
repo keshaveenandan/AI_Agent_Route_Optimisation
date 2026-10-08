@@ -17,6 +17,11 @@ so you can trace any figure back to its source.
 # there is exactly one definition of distance in this project.
 from scenario import DEPOT, distance_km, parcel_xy
 
+# Working out where a vague address really is from its past delivery pings.
+# It is a decision, so it belongs on this side of the line - but it is a big
+# enough idea to deserve its own file.
+import addresses
+
 # ---------------------------------------------------------------------------
 # The rules, straight from CLAUDE.md
 # ---------------------------------------------------------------------------
@@ -41,6 +46,60 @@ PRIORITY_BUFFER_MINUTES = 30.0
 
 # A route more than this much longer than yesterday needs a human to approve it.
 APPROVAL_THRESHOLD_MINUTES = 15.0
+
+# ---------------------------------------------------------------------------
+# How confident is the agent in a change it is asking you to approve?
+# ---------------------------------------------------------------------------
+# Every route on the approval card is already legal - it ends by 12:30, fits
+# the van, and keeps every priority deadline. The agent never proposes anything
+# else. So the question a supervisor is actually asking is not "is this
+# allowed?" but "how likely is this to survive contact with the morning?"
+#
+# A route that ends at 12:28 with half its weights guessed is legal and
+# fragile. One that ends at 11:40 on known weights and exact addresses is legal
+# and solid. Both would look identical as a bare "+22 min" on a table, which is
+# why the score below exists: it scores the six things that make a plan hold
+# up, says which one is the weakest, and lets the supervisor spend their
+# attention on the fragile routes instead of reading every row equally.
+#
+# The weights add up to 1.0. They are judgement, not measurement - which is
+# exactly why the screen shows the breakdown rather than only the total.
+CONFIDENCE_WEIGHTS = {
+    "time": 0.22,  # room before the 12:30 cut-off
+    "ask": 0.20,  # how big a change this is to someone's day
+    "address": 0.16,  # do we know where these parcels actually go
+    "weight": 0.14,  # do we know what is on the van
+    "capacity": 0.14,  # room before the van is full
+    "priority": 0.14,  # room before a deadline is missed
+}
+
+# Full marks for time headroom at this much room before 12:30, none at zero.
+CONFIDENCE_TIME_COMFORTABLE_MINUTES = 45.0
+
+# Full marks for an ask only just past the 15-minute rule, none at this much
+# past it. The shift is 4.5 hours, so 90 extra minutes is a third more work
+# again - about as much as anyone would ever be asked to absorb in a morning.
+# Anchoring it to the shift rather than picking a round number matters: set
+# this too low and every route in a bad morning scores zero here, which tells
+# the supervisor nothing about which one to look at.
+CONFIDENCE_ASK_LARGE_MINUTES = 90.0
+
+# Full marks for capacity when this much of the usable load is still free.
+CONFIDENCE_CAPACITY_COMFORTABLE_SHARE = 0.25
+
+# How much we trust that we know where a stop is. A precise address is a
+# certainty; a pin we worked out from pings is nearly as good; an address we
+# only know the district of is mostly guesswork.
+ADDRESS_TRUST_EXACT = 1.0
+ADDRESS_TRUST_RESOLVED = 0.80
+ADDRESS_TRUST_AREA_ONLY = 0.30
+
+# Where the bands fall.
+CONFIDENCE_HIGH = 0.80
+CONFIDENCE_MEDIUM = 0.60
+
+# A factor scoring below this is called out by name as a reason to look closer.
+CONFIDENCE_DOUBT_BELOW = 0.60
 
 
 # ---------------------------------------------------------------------------
@@ -396,11 +455,209 @@ def _driver_holding(routes, parcel_id):
 # 15-minute rule and the watch lists are written down once only.
 
 
+def _ramp_up(value, none_at, full_at):
+    """0.0 at `none_at` or worse, 1.0 at `full_at` or better, line between.
+
+    Used for the "more room is better" signals - minutes before the cut-off,
+    kilos before the van is full.
+    """
+    if value <= none_at:
+        return 0.0
+    if value >= full_at:
+        return 1.0
+    return (value - none_at) / (full_at - none_at)
+
+
+def address_certainty(scenario, parcel_ids):
+    """How well we know where this van's stops actually are, 0.0 to 1.0.
+
+    An exact address counts fully. A pin worked out from past delivery pings
+    counts nearly as much - it is a good guess backed by evidence, but it is
+    still a guess. An address we only know the district of barely counts: the
+    driver will be hunting for the door, and the six minutes we budgeted for
+    the stop is optimistic.
+
+    This is the bridge between the address work and the approval card. Pinning
+    down vague addresses does not just help the driver on the day; it visibly
+    raises the agent's confidence in the plan it is proposing.
+    """
+    if not parcel_ids:
+        return 1.0
+
+    parcels = scenario["parcels"]
+    trust = []
+    for parcel_id in parcel_ids:
+        parcel = parcels[parcel_id]
+        if not parcel.get("area_only"):
+            trust.append(ADDRESS_TRUST_EXACT)
+        elif parcel.get("address_resolved"):
+            trust.append(ADDRESS_TRUST_RESOLVED)
+        else:
+            trust.append(ADDRESS_TRUST_AREA_ONLY)
+
+    return sum(trust) / len(trust)
+
+
+def route_confidence(scenario, parcel_ids, change_minutes):
+    """How confident the agent is in a route it is proposing.
+
+    NOT a legality check - check_route() already did that, and the agent never
+    proposes an illegal route. This answers the next question: of the legal
+    plans, how robust is this one, and how big a favour is it asking?
+
+    Six signals, each scored 0.0 to 1.0 and weighted by CONFIDENCE_WEIGHTS:
+
+      time      minutes spare before the 12:30 cut-off. A route finishing at
+                12:29 is legal, but one slow lift or one wrong door and it is
+                not. Room here absorbs a bad morning.
+      ask       how far past the 15-minute rule the change is. A small ask is
+                more likely to be a good trade than a large one.
+      address   whether we know where the stops are (see address_certainty).
+      weight    the share of the van whose weight we actually know. Guessed
+                weights mean the real load could be heavier than planned.
+      capacity  kilos spare before the van is full.
+      priority  minutes spare on the tightest priority deadline, if any.
+
+    Returns a dict with the total, the band, every factor with its own score
+    and a one-line note, and the factors weak enough to be worth naming. The
+    breakdown is the point: a number on its own is something to argue with, a
+    number with "the weakest part is 9 minutes of slack before 12:30" is
+    something to act on.
+    """
+    verdict = check_route(scenario, parcel_ids)
+
+    # --- time before the cut-off -----------------------------------------
+    headroom = SHIFT_END_MINUTES - verdict["end_minutes"]
+    score_time = _ramp_up(headroom, 0.0, CONFIDENCE_TIME_COMFORTABLE_MINUTES)
+
+    # --- size of the ask --------------------------------------------------
+    # Measured from the threshold, not from zero: everything on the approval
+    # card is already over 15 minutes, so that is the sensible starting line.
+    over_threshold = max(0.0, change_minutes - APPROVAL_THRESHOLD_MINUTES)
+    score_ask = 1.0 - _ramp_up(over_threshold, 0.0, CONFIDENCE_ASK_LARGE_MINUTES)
+
+    # --- do we know where the stops are? ---------------------------------
+    score_address = address_certainty(scenario, parcel_ids)
+
+    # --- do we know what is on the van? ----------------------------------
+    score_weight = 1.0 - verdict["estimated_share"]
+
+    # --- room before the van is full --------------------------------------
+    usable = verdict["usable_capacity_kg"]
+    spare_share = (usable - verdict["load_kg"]) / usable if usable else 0.0
+    score_capacity = _ramp_up(
+        spare_share, 0.0, CONFIDENCE_CAPACITY_COMFORTABLE_SHARE
+    )
+
+    # --- room on the tightest deadline ------------------------------------
+    arrivals = verdict["priority_arrivals"]
+    if arrivals:
+        tightest = min(arrival["slack_minutes"] for arrival in arrivals)
+        score_priority = _ramp_up(tightest, 0.0, PRIORITY_BUFFER_MINUTES)
+        priority_note = f"{tightest:.0f} min spare on the tightest deadline"
+    else:
+        # No priority parcels on this van, so there is no deadline to miss.
+        score_priority = 1.0
+        priority_note = "no priority parcels on this van"
+
+    parcels = scenario["parcels"]
+    vague_stops = sum(
+        1 for pid in parcel_ids
+        if parcels[pid].get("area_only") and not parcels[pid].get("address_resolved")
+    )
+    pinned_stops = sum(
+        1 for pid in parcel_ids
+        if parcels[pid].get("area_only") and parcels[pid].get("address_resolved")
+    )
+
+    factors = [
+        {
+            "name": "Room before 12:30",
+            "score": score_time,
+            "weight": CONFIDENCE_WEIGHTS["time"],
+            "note": f"back at {verdict['end_clock']}, {headroom:.0f} min spare",
+        },
+        {
+            "name": "Size of the ask",
+            "score": score_ask,
+            "weight": CONFIDENCE_WEIGHTS["ask"],
+            "note": f"{change_minutes:+.0f} min on this driver's day",
+        },
+        {
+            "name": "Addresses known",
+            "score": score_address,
+            "weight": CONFIDENCE_WEIGHTS["address"],
+            "note": (
+                f"{vague_stops} stop{'s' if vague_stops != 1 else ''} still "
+                f"district-only"
+                + (f", {pinned_stops} pinned from past pings" if pinned_stops else "")
+                if vague_stops or pinned_stops else "every address is exact"
+            ),
+        },
+        {
+            "name": "Weights known",
+            "score": score_weight,
+            "weight": CONFIDENCE_WEIGHTS["weight"],
+            "note": f"{verdict['estimated_share']:.0%} of the van is guessed weight",
+        },
+        {
+            "name": "Room in the van",
+            "score": score_capacity,
+            "weight": CONFIDENCE_WEIGHTS["capacity"],
+            "note": (
+                f"{verdict['load_kg']:.0f} kg of {usable:.0f} kg usable "
+                f"({usable - verdict['load_kg']:.0f} kg spare)"
+            ),
+        },
+        {
+            "name": "Deadline headroom",
+            "score": score_priority,
+            "weight": CONFIDENCE_WEIGHTS["priority"],
+            "note": priority_note,
+        },
+    ]
+
+    confidence = sum(factor["score"] * factor["weight"] for factor in factors)
+    confidence = max(0.0, min(1.0, confidence))
+
+    # Name the weak parts, worst first. These are what a supervisor should read
+    # if they read nothing else on the row.
+    doubts = [
+        f"{factor['name'].lower()}: {factor['note']}"
+        for factor in sorted(factors, key=lambda f: f["score"])
+        if factor["score"] < CONFIDENCE_DOUBT_BELOW
+    ]
+
+    if confidence >= CONFIDENCE_HIGH:
+        band = "High"
+        headline = "Solid. Plenty of room on every rule this touches."
+    elif confidence >= CONFIDENCE_MEDIUM:
+        band = "Medium"
+        headline = "Workable, but it is leaning on something - see below."
+    else:
+        band = "Low"
+        headline = "Legal, but tight. Worth a proper look before you release it."
+
+    return {
+        "score": int(round(confidence * 100)),
+        "confidence": confidence,
+        "band": band,
+        "headline": headline,
+        "factors": factors,
+        "doubts": doubts,
+    }
+
+
 def _compare_and_split(scenario, routes_today, driver_ids):
     """Measure each route against yesterday and apply the 15-minute rule.
 
     Returns (applied_automatically, needs_approval). Routes more than the
     threshold longer than yesterday go in the second list.
+
+    Every row carries a confidence score, including the ones applied
+    automatically. The agent should be able to answer "how sure were you?"
+    about a decision it made without asking, not only about the ones it
+    brought to a human.
     """
     yesterday = scenario["yesterday_routes"]
 
@@ -420,6 +677,9 @@ def _compare_and_split(scenario, routes_today, driver_ids):
             "parcels_yesterday": len(yesterday[driver_id]),
             "parcels_today": len(routes_today[driver_id]),
             "end_clock": route_timeline(scenario, routes_today[driver_id])["end_clock"],
+            "confidence": route_confidence(
+                scenario, routes_today[driver_id], change
+            ),
         }
 
         if change <= APPROVAL_THRESHOLD_MINUTES:
@@ -427,7 +687,12 @@ def _compare_and_split(scenario, routes_today, driver_ids):
         else:
             approval.append(row)
 
-    approval.sort(key=lambda r: -r["change_minutes"])
+    # Least confident first. The biggest change is not the one most likely to
+    # go wrong, and the supervisor's attention is the scarce resource here - so
+    # the row that most needs thinking about goes at the top. Change in minutes
+    # breaks ties, and the driver id after that, so the order never wobbles
+    # between runs.
+    approval.sort(key=lambda r: (r["confidence"]["score"], -r["change_minutes"], r["driver"]))
     return automatic, approval
 
 
@@ -475,16 +740,93 @@ def _build_priority_status(scenario, routes_today, escalated):
     return status
 
 
-def _build_watch_lists(scenario, routes_today, changed_ids):
+def resolve_addresses_in_scope(scenario, parcel_ids, accepted_pins=()):
+    """Pin down the vague addresses among these parcels, before planning.
+
+    This runs BEFORE the parcels are sorted and inserted, which is the only
+    place it can sensibly run. Cheapest insertion measures distances; if an
+    address is going to move, it has to move before anything is measured
+    against it, or the agent optimises a route to the wrong door.
+
+    Only the parcels in scope are touched - the ones being re-homed and the
+    ones already on the candidate routes. An address on a route nobody is
+    changing today is left alone, the same way the route itself is.
+
+    accepted_pins - parcel ids the supervisor has pressed the button for. The
+                    agent adopts a pin on its own only when it is confident;
+                    these are the middling ones a human decided to trust.
+
+    Returns a dict:
+      resolutions - {parcel_id: resolution} for every vague address in scope
+      adopted     - the pins now being planned against
+      suggested   - pins good enough to offer, not good enough to take alone
+      blocked     - addresses the pings cannot settle, needing a phone call
+    """
+    resolutions = addresses.resolve_scenario(scenario, parcel_ids)
+    adopted = addresses.adopt_resolutions(scenario, resolutions, accepted_pins)
+    adopted_ids = {record["parcel_id"] for record in adopted}
+
+    suggested = sorted(
+        (
+            resolution for parcel_id, resolution in resolutions.items()
+            if resolution["band"] == "medium" and parcel_id not in adopted_ids
+        ),
+        key=lambda resolution: -resolution["confidence"],
+    )
+    blocked = sorted(
+        (
+            resolution for parcel_id, resolution in resolutions.items()
+            if resolution["band"] in ("low", "none") and parcel_id not in adopted_ids
+        ),
+        key=lambda resolution: -resolution["confidence"],
+    )
+
+    return {
+        "resolutions": resolutions,
+        "adopted": adopted,
+        "suggested": suggested,
+        "blocked": blocked,
+    }
+
+
+def _build_watch_lists(scenario, routes_today, changed_ids, resolutions=None):
     """Things the supervisor should keep half an eye on."""
     parcels = scenario["parcels"]
+    resolutions = resolutions or {}
 
-    area_only = [
-        {"parcel_id": pid, "driver": driver_id}
-        for driver_id in changed_ids
-        for pid in routes_today[driver_id]
-        if parcels[pid]["area_only"]
-    ]
+    # Every vague address that ended up on a route we changed, with what the
+    # agent managed to work out about it. A parcel that used to be one line
+    # saying "we are not sure where this is" can now say how sure, why, and
+    # whether anything can be done about it.
+    area_only = []
+    for driver_id in changed_ids:
+        for pid in routes_today[driver_id]:
+            parcel = parcels[pid]
+            if not parcel.get("area_only"):
+                continue
+
+            resolution = resolutions.get(pid)
+            area_only.append(
+                {
+                    "parcel_id": pid,
+                    "driver": driver_id,
+                    "district": parcel.get("district", "unknown"),
+                    "resolved": bool(parcel.get("address_resolved")),
+                    "band": resolution["band"] if resolution else "none",
+                    "confidence": resolution["confidence"] if resolution else 0.0,
+                    "pings_total": resolution["pings_total"] if resolution else 0,
+                    "pings_used": resolution["pings_used"] if resolution else 0,
+                    "shift_km": resolution["shift_km"] if resolution else 0.0,
+                    "headline": (
+                        resolution["headline"] if resolution
+                        else "No ping history looked at for this address."
+                    ),
+                }
+            )
+
+    # Unpinned first - those are the ones still worth worrying about - then
+    # least confident, then by id so the order never wobbles.
+    area_only.sort(key=lambda item: (item["resolved"], item["confidence"], item["parcel_id"]))
     estimated_vans = [
         {
             "driver": driver_id,
@@ -498,12 +840,16 @@ def _build_watch_lists(scenario, routes_today, changed_ids):
     return area_only, estimated_vans
 
 
-def run_agent(scenario, absent_ids):
+def run_agent(scenario, absent_ids, accepted_pins=()):
     """Re-plan the morning around some absent drivers.
 
     Works through the five steps in CLAUDE.md and returns one dictionary with
     everything that happened, so the screen in Stage 5 can display the result
     without having to work anything out for itself.
+
+    accepted_pins - parcel ids whose ping-based address pin the supervisor has
+                    accepted. The agent takes the confident pins by itself; a
+                    middling pin is only used once somebody says so.
     """
     parcels = scenario["parcels"]
     yesterday = scenario["yesterday_routes"]
@@ -537,8 +883,13 @@ def run_agent(scenario, absent_ids):
             "priority_status": [],
             "watch_area_only": [],
             "watch_estimated_vans": [],
+            "address_resolutions": {},
+            "address_adopted": [],
+            "address_suggested": [],
+            "address_blocked": [],
             "counts": {"moved": 0, "deferred": 0, "escalated": 0,
-                       "routes_changed": 0, "routes_untouched": len(yesterday)},
+                       "routes_changed": 0, "routes_untouched": len(yesterday),
+                       "addresses_pinned": 0, "addresses_to_decide": 0},
         }
 
     note("1 Notice", f"Called in sick: {', '.join(absent_ids)}.")
@@ -566,6 +917,44 @@ def run_agent(scenario, absent_ids):
          f"Considering only the {len(receiving_ids)} nearest working drivers: "
          f"{', '.join(receiving_ids)}. The other {untouched_count} working routes "
          f"are not candidates and will not be touched at all.")
+
+    # -- Step 2b: Pin down the vague addresses -----------------------------
+    # Before measuring a single distance, work out where the district-only
+    # addresses actually are, using the pings couriers left on past
+    # deliveries. This has to happen here: step 3 compares routes by distance,
+    # so an address that is going to move must move first.
+    in_scope = list(orphaned_ids)
+    for driver_id in receiving_ids:
+        in_scope.extend(routes_today[driver_id])
+
+    address_work = resolve_addresses_in_scope(scenario, in_scope, accepted_pins)
+    vague_count = len(address_work["resolutions"])
+
+    if vague_count:
+        pinned = address_work["adopted"]
+        by_supervisor = sum(1 for record in pinned if record["by_supervisor"])
+        note("2 Scope",
+             f"{vague_count} addresses in scope are district-only. Checked the "
+             f"delivery pings couriers left at each one.",
+             minutes_later=1)
+        if pinned:
+            average_shift = sum(r["shift_km"] for r in pinned) / len(pinned)
+            note("2 Scope",
+                 f"Pinned down {len(pinned)} of them from past deliveries, "
+                 f"moving each one {average_shift * 1000:.0f} m on average"
+                 + (f" ({by_supervisor} because you accepted the suggestion)"
+                    if by_supervisor else " - all confident enough to use")
+                 + ". Planning against the pins, not the labels.")
+        if address_work["suggested"]:
+            note("2 Scope",
+                 f"{len(address_work['suggested'])} more have a likely pin but "
+                 f"not a confident one. Left on the label and put on the "
+                 f"supervisor screen to decide.")
+        if address_work["blocked"]:
+            note("2 Scope",
+                 f"{len(address_work['blocked'])} cannot be pinned from pings "
+                 f"at all - too little history. These need a call to the "
+                 f"customer.")
 
     # -- Step 3: Optimise --------------------------------------------------
     # Priority parcels go first, while the routes are still relatively empty
@@ -678,7 +1067,7 @@ def run_agent(scenario, absent_ids):
 
     # Things the supervisor should keep half an eye on.
     watch_area_only, watch_estimated_vans = _build_watch_lists(
-        scenario, routes_today, changed_ids
+        scenario, routes_today, changed_ids, address_work["resolutions"]
     )
 
     note("5 Act or ask",
@@ -701,6 +1090,10 @@ def run_agent(scenario, absent_ids):
         "priority_status": priority_status,
         "watch_area_only": watch_area_only,
         "watch_estimated_vans": watch_estimated_vans,
+        "address_resolutions": address_work["resolutions"],
+        "address_adopted": address_work["adopted"],
+        "address_suggested": address_work["suggested"],
+        "address_blocked": address_work["blocked"],
         "counts": {
             "to_rehome": len(orphaned_ids),
             "moved": len(moved),
@@ -709,6 +1102,10 @@ def run_agent(scenario, absent_ids):
             "routes_considered": len(receiving_ids),
             "routes_changed": len(changed_ids),
             "routes_untouched": len(routes_today) - len(absent_ids) - len(changed_ids),
+            "addresses_vague": vague_count,
+            "addresses_pinned": len(address_work["adopted"]),
+            "addresses_to_decide": len(address_work["suggested"]),
+            "addresses_need_a_call": len(address_work["blocked"]),
         },
     }
 
@@ -760,7 +1157,8 @@ def group_calls_into_rounds(calls, window=ROUND_WINDOW_MINUTES):
     return rounds
 
 
-def _replan_round(scenario, routes_now, all_absent_ids, new_absent_ids, approved_routes):
+def _replan_round(scenario, routes_now, all_absent_ids, new_absent_ids,
+                  approved_routes, accepted_pins=()):
     """Re-home one round's worth of orphaned parcels into the current plan.
 
     Unlike run_agent, this starts from the plan as it stands - which may already
@@ -782,6 +1180,13 @@ def _replan_round(scenario, routes_now, all_absent_ids, new_absent_ids, approved
         scenario, gap_ids=new_absent_ids, unavailable_ids=all_absent_ids
     )
     unapproved = [d for d in candidates if d not in approved_routes]
+
+    # Pin down the vague addresses in this round's scope before anything is
+    # measured - same reason as in run_agent, see the note there.
+    in_scope = list(orphaned_ids)
+    for driver_id in candidates:
+        in_scope.extend(routes_now[driver_id])
+    address_work = resolve_addresses_in_scope(scenario, in_scope, accepted_pins)
 
     parcels = scenario["parcels"]
     priority_first = sorted(
@@ -837,14 +1242,17 @@ def _replan_round(scenario, routes_now, all_absent_ids, new_absent_ids, approved
         "deferred": deferred,
         "escalated": escalated,
         "touched_approved": touched_approved,
+        "address_work": address_work,
     }
 
 
-def run_morning(scenario, calls, approved_routes=()):
+def run_morning(scenario, calls, approved_routes=(), accepted_pins=()):
     """Replay a morning of sick calls, one round at a time.
 
     scenario        - the depot, from build_scenario()
     calls           - list of (minute, driver_id), from simulate_sick_calls()
+    accepted_pins   - parcel ids whose suggested address pin the supervisor
+                      accepted, same as in run_agent
     approved_routes - routes the supervisor has signed off. The agent avoids
                       disturbing these, and says so loudly if it has to.
 
@@ -882,6 +1290,12 @@ def run_morning(scenario, calls, approved_routes=()):
     all_deferred = []
     all_escalated = []
     approval_overrides = []
+
+    # Address work builds up across rounds. A later round can widen the scope
+    # onto addresses an earlier one never looked at, so the resolutions are
+    # merged rather than replaced.
+    all_resolutions = {}
+    all_adopted = {}
 
     def note(clock_minutes, step, message):
         log.append(
@@ -931,8 +1345,24 @@ def run_morning(scenario, calls, approved_routes=()):
             }
 
             outcome = _replan_round(
-                scenario, routes_now, all_absent_ids, new_absent, approved_now
+                scenario, routes_now, all_absent_ids, new_absent, approved_now,
+                accepted_pins,
             )
+
+            address_work = outcome["address_work"]
+            all_resolutions.update(address_work["resolutions"])
+            for record in address_work["adopted"]:
+                all_adopted[record["parcel_id"]] = record
+
+            if address_work["resolutions"]:
+                note(round_clock, "2 Scope",
+                     f"{len(address_work['resolutions'])} district-only "
+                     f"addresses in scope; pinned "
+                     f"{len(address_work['adopted'])} of them from past "
+                     f"delivery pings"
+                     + (f", {len(address_work['suggested'])} left for you to "
+                        f"decide" if address_work["suggested"] else "")
+                     + ".")
 
             held_back = sorted(approved_now & set(outcome["candidates"]))
             note(round_clock, "2 Scope",
@@ -1053,7 +1483,27 @@ def run_morning(scenario, calls, approved_routes=()):
     auto_applied, needs_approval = _compare_and_split(scenario, routes_now, changed_ids)
     priority_status = _build_priority_status(scenario, routes_now, escalated_final)
     watch_area_only, watch_estimated_vans = _build_watch_lists(
-        scenario, routes_now, changed_ids
+        scenario, routes_now, changed_ids, all_resolutions
+    )
+
+    # The morning's address work, gathered from every round. Worked out from
+    # the merged resolutions rather than summed per round, for the same reason
+    # the parcel totals are: a later round can look at an address an earlier
+    # one already handled, and adding the events up would count it twice.
+    address_adopted = sorted(all_adopted.values(), key=lambda r: -r["shift_km"])
+    address_suggested = sorted(
+        (
+            resolution for parcel_id, resolution in all_resolutions.items()
+            if resolution["band"] == "medium" and parcel_id not in all_adopted
+        ),
+        key=lambda resolution: -resolution["confidence"],
+    )
+    address_blocked = sorted(
+        (
+            resolution for parcel_id, resolution in all_resolutions.items()
+            if resolution["band"] in ("low", "none") and parcel_id not in all_adopted
+        ),
+        key=lambda resolution: -resolution["confidence"],
     )
 
     return {
@@ -1092,12 +1542,20 @@ def run_morning(scenario, calls, approved_routes=()):
             "routes_considered": len(changed_ids),
             "routes_changed": len(changed_ids),
             "routes_untouched": len(routes_now) - len(all_absent_ids) - len(changed_ids),
+            "addresses_vague": len(all_resolutions),
+            "addresses_pinned": len(address_adopted),
+            "addresses_to_decide": len(address_suggested),
+            "addresses_need_a_call": len(address_blocked),
         },
         "auto_applied": auto_applied,
         "needs_approval": needs_approval,
         "priority_status": priority_status,
         "watch_area_only": watch_area_only,
         "watch_estimated_vans": watch_estimated_vans,
+        "address_resolutions": all_resolutions,
+        "address_adopted": address_adopted,
+        "address_suggested": address_suggested,
+        "address_blocked": address_blocked,
     }
 
 
@@ -1126,22 +1584,30 @@ if __name__ == "__main__":
     print("\nNEEDS YOUR APPROVAL  (route more than "
           f"{APPROVAL_THRESHOLD_MINUTES:.0f} min longer than yesterday)")
     if result["needs_approval"]:
+        print("  Least confident first - that is the row worth your attention,")
+        print("  not necessarily the biggest change.")
         print(f"  {'driver':<8}{'parcels':>9}{'yesterday':>11}{'today':>8}"
-              f"{'change':>9}{'home':>8}")
+              f"{'change':>9}{'home':>8}{'confidence':>13}")
         for row in result["needs_approval"]:
+            confidence = row["confidence"]
             print(
                 f"  {row['driver']:<8}"
                 f"{row['parcels_yesterday']:>4} ->{row['parcels_today']:>3}"
                 f"{row['yesterday_minutes']:>9.0f}m{row['today_minutes']:>7.0f}m"
                 f"{row['change_minutes']:>+8.0f}m{row['end_clock']:>8}"
+                f"{confidence['score']:>8}% {confidence['band']:<6}"
             )
+            for doubt in confidence["doubts"]:
+                print(f"            weakest: {doubt}")
     else:
         print("  (none)")
 
     print(f"\nAPPLIED AUTOMATICALLY  ({len(result['auto_applied'])} routes)")
     for row in result["auto_applied"]:
         print(f"  {row['driver']}  {row['change_minutes']:+.0f} min  "
-              f"home {row['end_clock']}")
+              f"home {row['end_clock']}  "
+              f"confidence {row['confidence']['score']}% "
+              f"({row['confidence']['band']})")
 
     print("\nPRIORITY PARCELS")
     for status in result["priority_status"]:
@@ -1171,6 +1637,28 @@ if __name__ == "__main__":
     accounted = counts["moved"] + counts["deferred"] + counts["escalated"]
     print(f"\n  placed + deferred + escalated  {accounted}"
           f"  {'OK' if accounted == counts['to_rehome'] else 'MISMATCH'}")
+
+    print("\nVAGUE ADDRESSES PINNED DOWN FROM PAST DELIVERY PINGS")
+    print(f"  district-only addresses in scope        {counts['addresses_vague']}")
+    print(f"  pinned by the agent itself              {counts['addresses_pinned']}")
+    print(f"  suggested, waiting on the supervisor    {counts['addresses_to_decide']}")
+    print(f"  need a call to the customer             {counts['addresses_need_a_call']}")
+    if result["address_adopted"]:
+        marks = addresses.score_resolutions(world, result["address_resolutions"])
+        print(
+            f"  the pins the agent took moved the address "
+            f"{marks['acted_on_label_error_km'] * 1000:.0f} m -> "
+            f"{marks['acted_on_resolved_error_km'] * 1000:.0f} m from the real door"
+            f"  ({marks['acted_on_improved']} of {marks['acted_on']} got closer)"
+        )
+        print("  the three biggest corrections:")
+        for record in result["address_adopted"][:3]:
+            print(
+                f"    {record['parcel_id']}  {record['district']:<18} "
+                f"moved {record['shift_km'] * 1000:>4.0f} m on "
+                f"{record['pings_used']} past deliveries  "
+                f"(confidence {record['confidence']:.0%})"
+            )
 
     print("\nTO WATCH")
     print(f"  area-only addresses on changed routes   {len(result['watch_area_only'])}")

@@ -1,0 +1,20 @@
+{
+  "version": "0.0.1",
+  "autoPort": false,
+  "configurations": [
+    {
+      "name": "gulfpost-app",
+      "runtimeExecutable": "C:/Users/nanda/Desktop/gulfpost-prototype/python/.venv/Scripts/streamlit.exe",
+      "runtimeArgs": [
+        "run",
+        "app.py",
+        "--server.port",
+        "8531",
+        "--server.headless",
+        "true"
+      ],
+      "cwd": "python",
+      "port": 8531
+    }
+  ]
+}
